@@ -253,3 +253,4 @@ class BallDetector:
             "center": (cx, cy),
             "confidence": 1.0,
         }
+

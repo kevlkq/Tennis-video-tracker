@@ -24,26 +24,40 @@ class CourtDetector:
 
     def detect_lines(self, frame: np.ndarray) -> list[tuple[int, int, int, int]]:
         """Return list of (x1,y1,x2,y2) line segments for court markings."""
+        h, w = frame.shape[:2]
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
 
-        # Enhance white lines
-        _, thresh = cv2.threshold(gray, 180, 255, cv2.THRESH_BINARY)
+        # Only look in the bottom 65% of the frame — court is never in the sky
+        roi_y = int(h * 0.35)
+        roi = gray[roi_y:, :]
+
+        # Enhance white court lines only (very bright pixels)
+        _, thresh = cv2.threshold(roi, 200, 255, cv2.THRESH_BINARY)
         edges = cv2.Canny(thresh, 50, 150, apertureSize=3)
 
         lines_raw = cv2.HoughLinesP(
             edges,
             rho=1,
             theta=np.pi / 180,
-            threshold=80,
-            minLineLength=60,
-            maxLineGap=20,
+            threshold=120,        # higher = fewer false positives
+            minLineLength=80,     # ignore short stray lines
+            maxLineGap=15,
         )
 
         if lines_raw is None:
             self._cached_lines = []
             return []
 
-        lines = [tuple(l[0]) for l in lines_raw]
+        lines = []
+        for l in lines_raw:
+            x1, y1, x2, y2 = l[0]
+            # Filter by angle: keep only near-horizontal (≤30°) or near-vertical (≥60°)
+            angle = abs(np.degrees(np.arctan2(y2 - y1, x2 - x1)))
+            if angle > 30 and angle < 60:
+                continue
+            # Shift y coords back to full frame space
+            lines.append((x1, y1 + roi_y, x2, y2 + roi_y))
+
         self._cached_lines = lines
         return lines
 

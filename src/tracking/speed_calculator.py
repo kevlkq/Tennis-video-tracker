@@ -46,7 +46,7 @@ class BallSpeedCalculator:
             self._kf.predict()
             self._kf.update(np.array([[x], [y]]))
 
-        sx, sy = float(self._kf.x[0]), float(self._kf.x[1])
+        sx, sy = float(self._kf.x[0][0]), float(self._kf.x[1][0])
         self._positions.append((self._frame_idx, sx, sy))
 
         if len(self._positions) < 2:

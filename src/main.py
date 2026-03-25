@@ -179,58 +179,71 @@ def main():
         else:
             print("[WARN] Could not read first frame for calibration.")
 
-    print("[INFO] Press 'q' to quit, 's' to screenshot, SPACE to pause.")
+    import time
+
+    offline = bool(args.output)  # no display window when saving to file
+
+    if not offline:
+        DISPLAY_W, DISPLAY_H = 1280, 720
+        cv2.namedWindow("Tennis Tracker", cv2.WINDOW_NORMAL)
+        cv2.resizeWindow("Tennis Tracker", DISPLAY_W, DISPLAY_H)
+
+    print("[INFO] Press 'q' to quit." if not offline else
+          f"[INFO] Processing offline → {args.output}  (Ctrl+C to cancel)")
+
     paused = False
+    frame_count = 0
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    t_start = time.time()
 
     while True:
-        if not paused:
-            ret, frame = cap.read()
-            if not ret:
-                break
-
-            # --- Downscale for faster CPU inference ---
-            if args.scale != 1.0:
-                proc = cv2.resize(frame, None, fx=args.scale, fy=args.scale)
-            else:
-                proc = frame
-
-            # --- Run detections ---
-            ball = ball_det.detect(proc)
-            players = player_det.detect(proc)
-            court_lines = court_det.detect_lines(proc)
-
-            # --- Speed ---
-            center = ball["center"] if ball else None
-            speed_kph = speed_calc.update(center)
-            speed_mph = speed_calc.current_speed_mph
-
-            # --- Render ---
-            annotated = renderer.render(
-                frame,
-                ball=ball,
-                ball_trail=ball_det.get_trail(),
-                players=players,
-                court_lines=court_lines,
-                speed_kph=speed_kph,
-                speed_mph=speed_mph,
-            )
-
-            if writer:
-                writer.write(annotated)
-
-        cv2.imshow("Tennis Tracker", annotated if not paused else annotated)
-
-        key = cv2.waitKey(1) & 0xFF
-        if key == ord("q"):
+        ret, frame = cap.read()
+        if not ret:
             break
-        elif key == ord(" "):
-            paused = not paused
-            print("[INFO] Paused" if paused else "[INFO] Resumed")
-        elif key == ord("s"):
-            fname = f"screenshot_{int(cap.get(cv2.CAP_PROP_POS_FRAMES))}.png"
-            cv2.imwrite(fname, annotated)
-            print(f"[INFO] Saved {fname}")
 
+        frame_count += 1
+        proc = cv2.resize(frame, None, fx=args.scale, fy=args.scale) if args.scale != 1.0 else frame
+
+        ball         = ball_det.detect(proc)
+        players      = player_det.detect(proc)
+        court_lines  = court_det.detect_lines(proc)
+        center       = ball["center"] if ball else None
+        speed_kph    = speed_calc.update(center)
+
+        annotated = renderer.render(
+            frame,
+            ball=ball,
+            ball_trail=ball_det.get_trail(),
+            players=players,
+            court_lines=court_lines,
+            speed_kph=speed_kph,
+            speed_mph=speed_calc.current_speed_mph,
+        )
+
+        if writer:
+            writer.write(annotated)
+
+        if offline:
+            elapsed = time.time() - t_start
+            pct = frame_count / total_frames * 100 if total_frames else 0
+            fps_proc = frame_count / elapsed if elapsed > 0 else 0
+            eta = (total_frames - frame_count) / fps_proc if fps_proc > 0 else 0
+            print(f"\r[{pct:5.1f}%] frame {frame_count}/{total_frames} "
+                  f"| {fps_proc:.2f} fps | ETA {eta:.0f}s   ", end="", flush=True)
+        else:
+            cv2.imshow("Tennis Tracker", annotated)
+            key = cv2.waitKey(1) & 0xFF
+            if key == ord("q"):
+                break
+            elif key == ord(" "):
+                paused = not paused
+            elif key == ord("s"):
+                fname = f"screenshot_{frame_count}.png"
+                cv2.imwrite(fname, annotated)
+                print(f"\n[INFO] Saved {fname}")
+
+    if offline:
+        print()  # newline after progress
     cap.release()
     if writer:
         writer.release()
