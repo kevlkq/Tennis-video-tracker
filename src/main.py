@@ -1,0 +1,223 @@
+"""
+Tennis Video Tracker — main pipeline entry point.
+
+Usage:
+    python src/main.py --input path/to/video.mp4
+    python src/main.py --input 0          # webcam
+    python src/main.py --input video.mp4 --output out.mp4
+"""
+
+import argparse
+import sys
+import cv2
+import numpy as np
+
+from detection import BallDetector, PlayerDetector, CourtDetector
+from tracking import BallSpeedCalculator
+from overlay import Renderer
+
+
+def parse_args():
+    p = argparse.ArgumentParser(description="Tennis Video Tracker")
+    p.add_argument("--input", required=True, help="Video file path or camera index (0)")
+    p.add_argument("--output", default=None, help="Optional output video file path")
+    p.add_argument("--ball-model", default="yolov8n.pt", help="Model weights for ball detection")
+    p.add_argument("--backend", default="yolo", choices=["yolo", "tracknetv3", "artlabss"],
+                   help="Ball detection backend")
+    p.add_argument("--no-skeleton", action="store_true", help="Disable pose skeleton overlay")
+    p.add_argument("--no-court", action="store_true", help="Disable court line overlay")
+    p.add_argument("--no-speed", action="store_true", help="Disable speed HUD")
+    p.add_argument("--calibrate", action="store_true",
+                   help="Interactive court calibration: click 4 corners on the first frame "
+                        "to enable real-world speed (essential at low camera angles)")
+    return p.parse_args()
+
+
+def run_court_calibration(frame: np.ndarray, court_det) -> None:
+    """
+    Opens an interactive window where the user clicks the 4 court corners
+    to calibrate the homography for real-world speed calculation.
+
+    Click order:
+      1. Top-left baseline corner
+      2. Top-right baseline corner
+      3. Bottom-right baseline corner
+      4. Bottom-left baseline corner
+
+    Press ENTER or 'c' to confirm, ESC to skip calibration.
+    """
+    WINDOW = "Court Calibration"
+    corners: list[tuple[int, int]] = []
+    display = frame.copy()
+
+    CORNER_LABELS = [
+        "1: Top-Left",
+        "2: Top-Right",
+        "3: Bottom-Right",
+        "4: Bottom-Left",
+    ]
+    CORNER_COLOURS = [
+        (0, 255, 255),   # yellow
+        (0, 165, 255),   # orange
+        (0, 100, 255),   # red-orange
+        (255, 100, 0),   # blue
+    ]
+
+    def mouse_cb(event, x, y, flags, _param):
+        if event == cv2.EVENT_LBUTTONDOWN and len(corners) < 4:
+            corners.append((x, y))
+            idx = len(corners) - 1
+            cv2.circle(display, (x, y), 8, CORNER_COLOURS[idx], -1, cv2.LINE_AA)
+            cv2.circle(display, (x, y), 8, (255, 255, 255), 2, cv2.LINE_AA)
+            label = CORNER_LABELS[idx]
+            cv2.putText(display, label, (x + 10, y - 6),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, CORNER_COLOURS[idx], 2, cv2.LINE_AA)
+            # Draw line back to previous point
+            if idx > 0:
+                cv2.line(display, corners[idx - 1], corners[idx],
+                         (200, 200, 200), 1, cv2.LINE_AA)
+            if len(corners) == 4:
+                cv2.line(display, corners[-1], corners[0],
+                         (200, 200, 200), 1, cv2.LINE_AA)
+                cv2.putText(display, "Press ENTER to confirm, ESC to skip",
+                            (20, display.shape[0] - 15),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255, 255, 255), 2, cv2.LINE_AA)
+
+    cv2.namedWindow(WINDOW)
+    cv2.setMouseCallback(WINDOW, mouse_cb)
+
+    instruction = "Click 4 court corners: TL -> TR -> BR -> BL   |   ESC = skip"
+    next_label_y = 30
+
+    print("[CALIBRATION] Click the 4 court corners in order: Top-Left, Top-Right, Bottom-Right, Bottom-Left")
+    print("[CALIBRATION] Press ENTER/c to confirm, ESC to skip.")
+
+    while True:
+        view = display.copy()
+        # Show instruction + next corner prompt
+        cv2.putText(view, instruction, (10, 24),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 1, cv2.LINE_AA)
+        if len(corners) < 4:
+            next_label = f"Next click -> {CORNER_LABELS[len(corners)]}"
+            cv2.putText(view, next_label, (10, 52),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, CORNER_COLOURS[len(corners)], 2, cv2.LINE_AA)
+
+        cv2.imshow(WINDOW, view)
+        key = cv2.waitKey(20) & 0xFF
+
+        if key == 27:  # ESC — skip
+            print("[CALIBRATION] Skipped. Speed will use pixel fallback (~10-15% error).")
+            break
+        if key in (13, ord("c")) and len(corners) == 4:  # ENTER or 'c'
+            ok = court_det.calibrate(frame, corners)
+            if ok:
+                print("[CALIBRATION] Homography set — speed will use real-world metres.")
+            else:
+                print("[CALIBRATION] Calibration failed (bad corners?). Using pixel fallback.")
+            break
+
+    cv2.destroyWindow(WINDOW)
+
+
+def open_capture(source: str) -> cv2.VideoCapture:
+    src = int(source) if source.isdigit() else source
+    cap = cv2.VideoCapture(src)
+    if not cap.isOpened():
+        print(f"[ERROR] Cannot open video source: {source}")
+        sys.exit(1)
+    return cap
+
+
+def main():
+    args = parse_args()
+
+    cap = open_capture(args.input)
+    fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+    w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    print(f"[INFO] Source: {args.input}  |  {w}x{h} @ {fps:.1f} fps")
+
+    # --- Components ---
+    ball_det = BallDetector(backend=args.backend, model_path=args.ball_model, confidence=0.3)
+    player_det = PlayerDetector(model_path="yolov8n-pose.pt", confidence=0.4)
+    court_det = CourtDetector()
+    speed_calc = BallSpeedCalculator(fps=fps)
+    speed_calc.set_court_detector(court_det)  # enables real-world speed if calibrated
+
+    renderer = Renderer(
+        show_skeleton=not args.no_skeleton,
+        show_court=not args.no_court,
+        show_speed=not args.no_speed,
+    )
+
+    # --- Optional output writer ---
+    writer = None
+    if args.output:
+        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+        writer = cv2.VideoWriter(args.output, fourcc, fps, (w, h))
+
+    # --- Interactive calibration (highly recommended at low camera angles) ---
+    if args.calibrate:
+        ret, first_frame = cap.read()
+        if ret:
+            run_court_calibration(first_frame, court_det)
+            # Rewind to start so we don't skip the first frame
+            cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+        else:
+            print("[WARN] Could not read first frame for calibration.")
+
+    print("[INFO] Press 'q' to quit, 's' to screenshot, SPACE to pause.")
+    paused = False
+
+    while True:
+        if not paused:
+            ret, frame = cap.read()
+            if not ret:
+                break
+
+            # --- Run detections ---
+            ball = ball_det.detect(frame)
+            players = player_det.detect(frame)
+            court_lines = court_det.detect_lines(frame)
+
+            # --- Speed ---
+            center = ball["center"] if ball else None
+            speed_kph = speed_calc.update(center)
+            speed_mph = speed_calc.current_speed_mph
+
+            # --- Render ---
+            annotated = renderer.render(
+                frame,
+                ball=ball,
+                ball_trail=ball_det.get_trail(),
+                players=players,
+                court_lines=court_lines,
+                speed_kph=speed_kph,
+                speed_mph=speed_mph,
+            )
+
+            if writer:
+                writer.write(annotated)
+
+        cv2.imshow("Tennis Tracker", annotated if not paused else annotated)
+
+        key = cv2.waitKey(1) & 0xFF
+        if key == ord("q"):
+            break
+        elif key == ord(" "):
+            paused = not paused
+            print("[INFO] Paused" if paused else "[INFO] Resumed")
+        elif key == ord("s"):
+            fname = f"screenshot_{int(cap.get(cv2.CAP_PROP_POS_FRAMES))}.png"
+            cv2.imwrite(fname, annotated)
+            print(f"[INFO] Saved {fname}")
+
+    cap.release()
+    if writer:
+        writer.release()
+    cv2.destroyAllWindows()
+    print("[INFO] Done.")
+
+
+if __name__ == "__main__":
+    main()
