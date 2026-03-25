@@ -30,6 +30,8 @@ def parse_args():
     p.add_argument("--calibrate", action="store_true",
                    help="Interactive court calibration: click 4 corners on the first frame "
                         "to enable real-world speed (essential at low camera angles)")
+    p.add_argument("--scale", type=float, default=1.0,
+                   help="Downscale frames before detection (e.g. 0.5 = half resolution, faster on CPU)")
     return p.parse_args()
 
 
@@ -48,7 +50,14 @@ def run_court_calibration(frame: np.ndarray, court_det) -> None:
     """
     WINDOW = "Court Calibration"
     corners: list[tuple[int, int]] = []
-    display = frame.copy()
+
+    # Scale frame to fit screen (max 1280x720 for the calibration window)
+    MAX_W, MAX_H = 1280, 720
+    h_orig, w_orig = frame.shape[:2]
+    scale = min(MAX_W / w_orig, MAX_H / h_orig, 1.0)
+    disp_w = int(w_orig * scale)
+    disp_h = int(h_orig * scale)
+    display = cv2.resize(frame, (disp_w, disp_h)) if scale < 1.0 else frame.copy()
 
     CORNER_LABELS = [
         "1: Top-Left",
@@ -65,20 +74,23 @@ def run_court_calibration(frame: np.ndarray, court_det) -> None:
 
     def mouse_cb(event, x, y, flags, _param):
         if event == cv2.EVENT_LBUTTONDOWN and len(corners) < 4:
-            corners.append((x, y))
+            # Map display coords back to original frame coords
+            orig_x = int(x / scale)
+            orig_y = int(y / scale)
+            corners.append((orig_x, orig_y))
             idx = len(corners) - 1
+            # Draw on display using display-space coords
             cv2.circle(display, (x, y), 8, CORNER_COLOURS[idx], -1, cv2.LINE_AA)
             cv2.circle(display, (x, y), 8, (255, 255, 255), 2, cv2.LINE_AA)
             label = CORNER_LABELS[idx]
             cv2.putText(display, label, (x + 10, y - 6),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.6, CORNER_COLOURS[idx], 2, cv2.LINE_AA)
-            # Draw line back to previous point
             if idx > 0:
-                cv2.line(display, corners[idx - 1], corners[idx],
-                         (200, 200, 200), 1, cv2.LINE_AA)
+                prev_disp = (int(corners[idx - 1][0] * scale), int(corners[idx - 1][1] * scale))
+                cv2.line(display, prev_disp, (x, y), (200, 200, 200), 1, cv2.LINE_AA)
             if len(corners) == 4:
-                cv2.line(display, corners[-1], corners[0],
-                         (200, 200, 200), 1, cv2.LINE_AA)
+                first_disp = (int(corners[0][0] * scale), int(corners[0][1] * scale))
+                cv2.line(display, (x, y), first_disp, (200, 200, 200), 1, cv2.LINE_AA)
                 cv2.putText(display, "Press ENTER to confirm, ESC to skip",
                             (20, display.shape[0] - 15),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255, 255, 255), 2, cv2.LINE_AA)
@@ -92,9 +104,10 @@ def run_court_calibration(frame: np.ndarray, court_det) -> None:
     print("[CALIBRATION] Click the 4 court corners in order: Top-Left, Top-Right, Bottom-Right, Bottom-Left")
     print("[CALIBRATION] Press ENTER/c to confirm, ESC to skip.")
 
+    cv2.resizeWindow(WINDOW, disp_w, disp_h)
+
     while True:
         view = display.copy()
-        # Show instruction + next corner prompt
         cv2.putText(view, instruction, (10, 24),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 1, cv2.LINE_AA)
         if len(corners) < 4:
@@ -175,10 +188,16 @@ def main():
             if not ret:
                 break
 
+            # --- Downscale for faster CPU inference ---
+            if args.scale != 1.0:
+                proc = cv2.resize(frame, None, fx=args.scale, fy=args.scale)
+            else:
+                proc = frame
+
             # --- Run detections ---
-            ball = ball_det.detect(frame)
-            players = player_det.detect(frame)
-            court_lines = court_det.detect_lines(frame)
+            ball = ball_det.detect(proc)
+            players = player_det.detect(proc)
+            court_lines = court_det.detect_lines(proc)
 
             # --- Speed ---
             center = ball["center"] if ball else None

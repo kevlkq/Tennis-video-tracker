@@ -167,94 +167,72 @@ class BallDetector:
         }
 
     # ------------------------------------------------------------------
-    # ArtLabss TrackNet backend (TensorFlow / Keras)
+    # ArtLabss TrackNet backend (ONNX Runtime + DirectML / Arc GPU)
     # ------------------------------------------------------------------
 
     def _load_artlabss(self, model_path: str) -> None:
         """
-        Build the ArtLabss TrackNet architecture then load weights-only file.
-
-        The file ArtLabss/WeightsTracknet/model.1 is weights-only HDF5 —
-        we must rebuild the architecture first, then call load_weights().
-        Architecture is imported directly from the ArtLabss repo.
+        Load TrackNet as an ONNX model via ONNX Runtime with DirectML (Arc GPU).
+        Expects models/tracknet.onnx — run convert_to_onnx.py once to generate it.
+        Falls back to CPU if DirectML is unavailable.
         """
-        import sys
+        import onnxruntime as ort
         import os
-        artlabss_path = os.path.join(os.path.dirname(__file__), "..", "..", "ArtLabss")
-        if artlabss_path not in sys.path:
-            sys.path.insert(0, artlabss_path)
 
-        try:
-            from Models.tracknet import trackNet
-        except ImportError:
-            raise ImportError(
-                "Cannot import ArtLabss trackNet. "
-                "Make sure you cloned the repo: git clone https://github.com/ArtLabss/tennis-tracking.git ArtLabss"
+        onnx_path = os.path.join(os.path.dirname(__file__), "..", "..", "models", "tracknet.onnx")
+        onnx_path = os.path.normpath(onnx_path)
+
+        if not os.path.exists(onnx_path):
+            raise FileNotFoundError(
+                f"ONNX model not found at {onnx_path}. "
+                "Run: python convert_to_onnx.py"
             )
 
-        # ArtLabss constants: 256 classes, 360x640 input
-        self._artlabss_n_classes = 256
+        providers = (
+            ["DmlExecutionProvider", "CPUExecutionProvider"]
+            if "DmlExecutionProvider" in ort.get_available_providers()
+            else ["CPUExecutionProvider"]
+        )
+        self._ort_session = ort.InferenceSession(onnx_path, providers=providers)
+        self._ort_input_name = self._ort_session.get_inputs()[0].name
+
         self._artlabss_h = 360
         self._artlabss_w = 640
+        self._artlabss_n_classes = 256
 
-        self._tf_model = trackNet(
-            self._artlabss_n_classes,
-            input_height=self._artlabss_h,
-            input_width=self._artlabss_w,
-        )
-        self._tf_model.compile(
-            loss="categorical_crossentropy",
-            optimizer="adadelta",
-            metrics=["accuracy"],
-        )
-        # Keras 3 requires .h5 extension for legacy weight files.
-        # If the file lacks it, make a renamed copy and load that instead.
-        import shutil, tempfile, pathlib
-        p = pathlib.Path(model_path)
-        if p.suffix.lower() != ".h5":
-            tmp = pathlib.Path(tempfile.mkdtemp()) / (p.stem + ".h5")
-            shutil.copy2(p, tmp)
-            load_path = str(tmp)
-            print(f"[ArtLabss] Renamed weights to temp .h5 for Keras 3 compatibility")
-        else:
-            load_path = model_path
-
-        self._tf_model.load_weights(load_path)
-        print(f"[ArtLabss] Loaded TrackNet weights from {model_path}")
+        device = "Arc GPU (DirectML)" if "DmlExecutionProvider" in providers else "CPU"
+        print(f"[ArtLabss] Loaded TrackNet ONNX on {device}")
 
     def _detect_artlabss(self) -> dict | None:
         """
-        Run ArtLabss TrackNet inference on the current frame.
+        Run ArtLabss TrackNet inference via ONNX Runtime.
 
-        Input:  single frame, channels_first → (1, 3, 360, 640)
-        Output: (H*W, n_classes) softmax → argmax → (H, W) grayscale heatmap
-        Ball found via threshold + HoughCircles (matches original ArtLabss logic).
+        Input:  single frame → (1, 3, 360, 640) float32
+        Output: (1, H*W, N_CLASSES) softmax → argmax → (H, W) heatmap
+        Ball found via threshold + HoughCircles.
         """
         if not self._frame_buffer:
             self.trail.append(None)
             return None
 
-        INPUT_W = self._artlabss_w   # 640
-        INPUT_H = self._artlabss_h   # 360
-        N_CLASSES = self._artlabss_n_classes  # 256
+        INPUT_W = self._artlabss_w
+        INPUT_H = self._artlabss_h
+        N_CLASSES = self._artlabss_n_classes
 
         frame = self._frame_buffer[-1]
         orig_h, orig_w = frame.shape[:2]
 
         img = cv2.resize(frame, (INPUT_W, INPUT_H)).astype(np.float32)
-        # channels_first: (H, W, 3) → (3, H, W)
-        X = np.rollaxis(img, 2, 0)
-        tensor = np.array([X])  # (1, 3, H, W)
+        X = np.rollaxis(img, 2, 0)          # (H,W,3) → (3,H,W)
+        tensor = np.array([X])              # (1, 3, H, W)
 
-        pr = self._tf_model.predict(tensor, verbose=0)[0]
-        # pr shape: (H*W, N_CLASSES) → (H, W, N_CLASSES) → argmax → (H, W)
-        pr = pr.reshape((INPUT_H, INPUT_W, N_CLASSES)).argmax(axis=2).astype(np.uint8)
+        pr = self._ort_session.run(None, {self._ort_input_name: tensor})[0]
+        # pr shape: (1, H*W, N_CLASSES)
+        pr = pr[0].reshape((INPUT_H, INPUT_W, N_CLASSES)).argmax(axis=2).astype(np.uint8)
 
-        # Scale heatmap back to original frame size
         heatmap = cv2.resize(pr, (orig_w, orig_h))
         _, heatmap = cv2.threshold(heatmap, 127, 255, cv2.THRESH_BINARY)
 
-        # Find ball circle in heatmap
         circles = cv2.HoughCircles(
             heatmap, cv2.HOUGH_GRADIENT,
             dp=1, minDist=1, param1=50, param2=2,
@@ -267,11 +245,11 @@ class BallDetector:
 
         cx = int(circles[0][0][0])
         cy = int(circles[0][0][1])
-        r = max(int(circles[0][0][2]), 4)
+        r  = max(int(circles[0][0][2]), 4)
 
         self.trail.append((cx, cy))
         return {
             "bbox": (cx - r, cy - r, cx + r, cy + r),
             "center": (cx, cy),
-            "confidence": float(max_val),
+            "confidence": 1.0,
         }
